@@ -192,37 +192,68 @@ def delete_caller(client_id: str) -> None:
 # ---- Health probing -----------------------------------------------------------
 
 
-def _probe_one(url: str) -> bool:
-    """GET the agent's well-known card. 2xx within PROBE_TIMEOUT = alive."""
+def _probe_one(url: str) -> Optional[dict]:
+    """GET the agent's well-known card. Returns parsed card dict on success.
+
+    Returns None if the agent is unreachable or the card isn't valid JSON.
+    A 2xx with a parseable body counts as "alive"; callers compare the card's
+    name field against the registered name to detect impersonation.
+    """
     card_url = url.rstrip("/") + PROBE_CARD_PATH
     try:
         resp = requests.get(card_url, timeout=PROBE_TIMEOUT)
-        return resp.status_code < 400
+        if resp.status_code >= 400:
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            # Non-JSON body but 2xx — treat as alive but no card to sync.
+            return {}
     except requests.RequestException:
-        return False
+        return None
 
 
 def probe_all(max_workers: int = PROBE_MAX_WORKERS) -> dict:
     """Probe every registered agent concurrently (ignores visibility).
 
-    Updates last_ok / consecutive_failures / last_checked_at in place. Returns
-    a {id: bool} map of this probe's results (for logging/testing).
+    For each agent: GET its agent-card, verify alive, and if the card's name
+    matches the registered name, sync description/type from the card into the
+    DB (so agents can update their description without re-registering). A card
+    whose name doesn't match is marked unhealthy (possible impersonation).
+
+    Returns a {id: bool} map of this probe's results.
     """
     with _session() as session:
         rows = session.scalars(select(AgentModel)).all()
         if not rows:
             return {}
-        targets = [(r.id, r.url) for r in rows]
+        # Snapshot id + url + name so we can compare card name after probing.
+        targets = [(r.id, r.url, r.name) for r in rows]
 
     results: dict = {}
+    raw_cards: dict = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {pool.submit(_probe_one, url): aid for aid, url in targets}
+        future_map = {
+            pool.submit(_probe_one, url): (aid, name) for aid, url, name in targets
+        }
         for fut in future_map:
-            aid = future_map[fut]
+            aid, name = future_map[fut]
             try:
-                results[aid] = bool(fut.result())
+                card = fut.result()
             except Exception:
+                card = None
+            if card is None:
                 results[aid] = False
+            else:
+                # Alive (got a 2xx response). Verify name match if card has one.
+                card_name = card.get("name") if isinstance(card, dict) else None
+                if card_name and card_name != name:
+                    # Name mismatch — likely impersonation. Mark unhealthy.
+                    results[aid] = False
+                    raw_cards[aid] = None
+                else:
+                    results[aid] = True
+                    raw_cards[aid] = card if card else None
 
     now = datetime.utcnow()
     with _session() as session:
@@ -234,6 +265,16 @@ def probe_all(max_workers: int = PROBE_MAX_WORKERS) -> dict:
             if ok:
                 row.last_ok = True
                 row.consecutive_failures = 0
+                # Auto-sync description/type from the agent's card.
+                card = raw_cards.get(aid)
+                if isinstance(card, dict):
+                    new_desc = card.get("description")
+                    if new_desc and new_desc != row.description:
+                        row.description = new_desc
+                    # type is optional in some cards; only sync if present.
+                    new_type = card.get("type")
+                    if new_type and new_type != row.type:
+                        row.type = new_type
             else:
                 row.last_ok = False
                 row.consecutive_failures = (row.consecutive_failures or 0) + 1
