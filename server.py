@@ -64,8 +64,17 @@ class AgentUpdate(BaseModel):
 
 class CallerSpec(BaseModel):
     client_id: str
-    key: str
+    key: Optional[str] = Field(
+        default=None,
+        description="API key for this caller. If omitted, a random one is generated and returned.",
+    )
     is_admin: bool = False
+
+
+class CallerResponse(BaseModel):
+    client_id: str
+    is_admin: bool
+    key: str = Field(description="The caller's API key. Only returned on creation/rotation — save it, it won't be shown again.")
 
 
 # ---- Auth dependency ---------------------------------------------------------
@@ -120,12 +129,16 @@ def register_agent(
     """
     if not repository.verify_key(caller_id, caller_key):
         return {"error": "invalid caller_id or caller_key"}
+    data = {"name": name, "url": url, "description": description, "type": type}
     try:
-        return repository.create_agent(
-            {"name": name, "url": url, "description": description, "type": type}
-        )
+        return repository.create_agent(data)
     except repository.AgentAlreadyExists:
-        return {"error": f"agent '{name}' @ '{url}' already registered"}
+        # Upsert: update url/description on re-register (e.g. after restart with
+        # changed address). Idempotent — safe to call on every startup.
+        try:
+            return repository.update_agent(name, {"url": url, "description": description, "type": type})
+        except repository.AgentNotFound:
+            return {"error": f"agent '{name}' already registered but could not update"}
 
 
 @mcp.tool()
@@ -230,24 +243,33 @@ def reload(caller_id: str = Depends(require_caller)):
 
 @app.post("/agents", status_code=201)
 def create_agent(spec: AgentSpec, caller_id: str = Depends(require_caller)):
+    """Register an agent. Upsert by name: if name exists (any url), update it.
+    This makes agent self-registration idempotent across restarts and url changes."""
+    allowed = spec.allowed_callers if repository.is_admin(caller_id) else []
+    data = {
+        "name": spec.name,
+        "url": spec.url,
+        "description": spec.description,
+        "type": spec.type,
+        "allowed_callers": allowed,
+    }
+    # Check if an agent with this name already exists (regardless of url).
+    existing = repository.get_agent_any(spec.name)
+    if existing is not None:
+        # Upsert by name: update url/description/type. allowed_callers only for admin.
+        updatable = {"url": spec.url, "description": spec.description, "type": spec.type}
+        if repository.is_admin(caller_id):
+            updatable["allowed_callers"] = allowed
+        try:
+            return repository.update_agent(spec.name, updatable)
+        except repository.AgentNotFound:
+            pass  # race condition — fall through to create
+    # No existing agent with this name → create new.
     try:
-        # Only an admin may restrict visibility (allowed_callers). Non-admins
-        # always register public agents regardless of what they send.
-        allowed = spec.allowed_callers if repository.is_admin(caller_id) else []
-        return repository.create_agent(
-            {
-                "name": spec.name,
-                "url": spec.url,
-                "description": spec.description,
-                "type": spec.type,
-                "allowed_callers": allowed,
-            }
-        )
+        return repository.create_agent(data)
     except repository.AgentAlreadyExists:
-        raise HTTPException(
-            status_code=409,
-            detail=f"agent '{spec.name}' @ '{spec.url}' already exists",
-        )
+        # (name,url) both match exactly — truly a duplicate, treat as success.
+        return existing or {"name": spec.name, "url": spec.url, "description": spec.description, "type": spec.type}
 
 
 @app.put("/agents/{name}")
@@ -281,12 +303,19 @@ def list_callers(admin: str = Depends(require_admin)):
     return {"callers": repository.list_callers()}
 
 
-@app.post("/callers", status_code=201)
+@app.post("/callers", status_code=201, response_model=CallerResponse)
 def create_caller(spec: CallerSpec, admin: str = Depends(require_admin)):
+    """Create a caller. If key is omitted, a random one is generated.
+    The key is returned in the response (it won't be shown again — save it)."""
+    import secrets
+
+    key = spec.key if spec.key else secrets.token_urlsafe(32)
     try:
-        return repository.add_caller(spec.client_id, spec.key, spec.is_admin)
+        result = repository.add_caller(spec.client_id, key, spec.is_admin)
     except repository.CallerAlreadyExists:
         raise HTTPException(status_code=409, detail=f"caller '{spec.client_id}' already exists")
+    # Return the plaintext key alongside the caller info (only time it's shown).
+    return CallerResponse(client_id=result["client_id"], is_admin=result["is_admin"], key=key)
 
 
 @app.delete("/callers/{client_id}")
@@ -296,6 +325,20 @@ def delete_caller(client_id: str, admin: str = Depends(require_admin)):
     except repository.AgentNotFound:
         raise HTTPException(status_code=404, detail=f"caller '{client_id}' not found")
     return {"ok": True, "deleted": client_id}
+
+
+@app.put("/callers/{client_id}/key", response_model=CallerResponse)
+def rotate_caller_key(client_id: str, admin: str = Depends(require_admin)):
+    """Rotate (reset) a caller's API key. Generates a new random key.
+    The old key immediately stops working. Returns the new key (save it)."""
+    import secrets
+
+    new_key = secrets.token_urlsafe(32)
+    try:
+        result = repository.reset_caller_key(client_id, new_key)
+    except repository.AgentNotFound:
+        raise HTTPException(status_code=404, detail=f"caller '{client_id}' not found")
+    return CallerResponse(client_id=result["client_id"], is_admin=result["is_admin"], key=new_key)
 
 
 # ---- Entrypoint ----------------------------------------------------------------

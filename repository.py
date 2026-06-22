@@ -189,6 +189,20 @@ def delete_caller(client_id: str) -> None:
         session.commit()
 
 
+def reset_caller_key(client_id: str, new_key: str) -> dict:
+    """Replace a caller's API key. Raises AgentNotFound if caller doesn't exist."""
+    with _session() as session:
+        row = session.scalar(
+            select(CallerModel).where(CallerModel.client_id == client_id)
+        )
+        if row is None:
+            raise AgentNotFound(client_id)
+        row.key_hash = _hash_key(new_key)
+        session.commit()
+        session.refresh(row)
+        return row.to_dict()
+
+
 # ---- Health probing -----------------------------------------------------------
 
 
@@ -330,6 +344,13 @@ def get_agent(name: str, caller_id: Optional[str] = None) -> Optional[dict]:
 
 
 # ---- Writes -------------------------------------------------------------------
+
+
+def get_agent_any(name: str) -> Optional[dict]:
+    """Return an agent by name regardless of health/visibility. For upsert checks."""
+    with _session() as session:
+        row = session.scalar(select(AgentModel).where(AgentModel.name == name))
+        return row.to_dict() if row else None
 
 
 def create_agent(data: dict) -> dict:
